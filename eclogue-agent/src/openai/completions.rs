@@ -12,8 +12,8 @@ use crate::tooling::{ToolRegistry, ToolRegistryBuilder, ToolRegistryError};
 
 use super::transport::ReqwestOpenAiApi;
 use super::types::{
-    OpenAiApi, OpenAiAuth, OpenAiChatRequest, OpenAiMessage, OpenAiStreamEvent,
-    OpenAiToolDefinition,
+    OpenAiApi, OpenAiAssistantFunctionCall, OpenAiAssistantToolCall, OpenAiAuth,
+    OpenAiChatRequest, OpenAiMessage, OpenAiStreamEvent, OpenAiToolCall, OpenAiToolDefinition,
 };
 
 /// Model identifier used when callers do not explicitly choose one.
@@ -62,26 +62,6 @@ impl<A: OpenAiApi> OpenAiAgent<A> {
         OpenAiAgentBuilder::new(api)
     }
 
-    /// Builds a normalized provider request using current state.
-    async fn build_request(&self) -> OpenAiChatRequest {
-        let history_snapshot = self.history.lock().await.clone();
-        let tools = self
-            .tool_registry
-            .definitions()
-            .into_iter()
-            .map(|definition| OpenAiToolDefinition {
-                name: definition.name,
-                description: definition.description,
-                input_schema: definition.input_schema,
-            })
-            .collect();
-
-        OpenAiChatRequest {
-            model: self.model.clone(),
-            messages: history_snapshot,
-            tools,
-        }
-    }
 }
 
 /// Builder used to construct an OpenAI-backed agent ergonomically.
@@ -191,7 +171,7 @@ impl<A: OpenAiApi> OpenAiAgentBuilder<A> {
 #[async_trait]
 impl<A> AgentSession for OpenAiAgent<A>
 where
-    A: OpenAiApi + 'static,
+    A: OpenAiApi + Clone + 'static,
 {
     async fn send_message(&mut self, message: String) -> Result<AgentReply, AgentError> {
         // Keep the two public interfaces behaviorally identical:
@@ -222,120 +202,144 @@ where
         }
 
         // Interface step 2:
-        // Build the provider request snapshot from current history + registered tools.
-        // This isolates request construction from later async work in the spawned task.
-        let request = self.build_request().await;
-        let mut upstream_stream = self
-            .api
-            .stream_chat_completion(&self.auth, request)
-            .await
-            .map_err(|error| AgentError::Provider(error.to_string()))?;
-
-        // Interface step 3:
-        // Bridge upstream OpenAI events into provider-agnostic `AgentEvent` values.
-        // `sender`/`receiver` is the boundary object exposed to callers.
+        // Bridge iterative OpenAI turns into provider-agnostic `AgentEvent` values via
+        // `sender`/`receiver`. The spawned task keeps looping until OpenAI returns a turn
+        // with no tool calls, at which point we emit one final MessageComplete.
+        let api = self.api.clone();
+        let auth = self.auth.clone();
+        let model = self.model.clone();
         let history = Arc::clone(&self.history);
         let tools = self.tool_registry.clone();
+        let tool_definitions: Vec<OpenAiToolDefinition> = self
+            .tool_registry
+            .definitions()
+            .into_iter()
+            .map(|definition| OpenAiToolDefinition {
+                name: definition.name,
+                description: definition.description,
+                input_schema: definition.input_schema,
+            })
+            .collect();
         let (sender, receiver) = mpsc::channel(64);
 
         tokio::spawn(async move {
-            // `assistant_content` is the canonical assembled assistant reply for this turn.
-            // We keep this locally while streaming deltas so we can:
-            // 1) emit immediate `MessageDelta` events to the caller
-            // 2) commit a single final assistant message into conversation history
+            // `assistant_content` tracks all assistant text emitted across iterative model turns
+            // for this user request. This value becomes the final MessageComplete payload.
             let mut assistant_content = String::new();
 
-            // Tool outputs are also appended to history, but only after successful stream
-            // completion. Buffering avoids partial history commits if stream execution fails.
-            let mut tool_messages_for_history = Vec::new();
-
-            while let Some(next_event) = upstream_stream.next().await {
-                match next_event {
-                    Ok(OpenAiStreamEvent::TextDelta(delta)) => {
-                        // Interface mapping:
-                        // OpenAI text delta -> AgentEvent::MessageDelta
-                        assistant_content.push_str(&delta);
-                        if sender
-                            .send(Ok(AgentEvent::MessageDelta { delta }))
-                            .await
-                            .is_err()
-                        {
-                            // Caller dropped stream receiver; stop background work.
-                            return;
-                        }
+            loop {
+                // Build a fresh provider request from the latest committed history so each
+                // follow-up turn includes prior assistant tool calls + tool outputs.
+                let request = {
+                    let history_snapshot = history.lock().await.clone();
+                    OpenAiChatRequest {
+                        model: model.clone(),
+                        messages: history_snapshot,
+                        tools: tool_definitions.clone(),
                     }
-                    Ok(OpenAiStreamEvent::ToolCall(tool_call)) => {
-                        // Interface mapping:
-                        // OpenAI tool call -> request event + local tool execution +
-                        // completion event.
-                        let call_id = tool_call.call_id.clone();
-                        let tool_name = tool_call.tool_name.clone();
-                        let arguments = tool_call.arguments.clone();
+                };
 
-                        if sender
-                            .send(Ok(AgentEvent::ToolCallRequested {
-                                call_id: call_id.clone(),
-                                tool_name: tool_name.clone(),
-                                arguments: arguments.clone(),
-                            }))
-                            .await
-                            .is_err()
-                        {
-                            // Caller dropped stream receiver; stop background work.
-                            return;
-                        }
-
-                        // Invoke the registered local tool implementation synchronously
-                        // within this response-processing task so event ordering remains:
-                        // ToolCallRequested -> ToolCallCompleted.
-                        let tool_output = tools.invoke(&tool_name, arguments).await;
-
-                        // Store tool output in provider-message form for future turns.
-                        tool_messages_for_history.push(OpenAiMessage::tool(
-                            call_id.clone(),
-                            tool_name.clone(),
-                            tool_output.to_string(),
-                        ));
-
-                        if sender
-                            .send(Ok(AgentEvent::ToolCallCompleted {
-                                call_id,
-                                tool_name,
-                                output: tool_output,
-                            }))
-                            .await
-                            .is_err()
-                        {
-                            // Caller dropped stream receiver; stop background work.
-                            return;
-                        }
-                    }
-                    // OpenAI stream reached logical completion marker.
-                    Ok(OpenAiStreamEvent::Done) => break,
+                let mut upstream_stream = match api.stream_chat_completion(&auth, request).await {
+                    Ok(stream) => stream,
                     Err(error) => {
-                        // Normalize upstream transport/parsing errors into the provider-
-                        // agnostic error type expected by `AgentSession`.
                         let _ = sender
                             .send(Err(AgentError::Provider(error.to_string())))
                             .await;
                         return;
                     }
+                };
+
+                let mut turn_assistant_content = String::new();
+                let mut turn_tool_calls = Vec::<OpenAiToolCall>::new();
+                let mut turn_tool_messages_for_history = Vec::new();
+
+                while let Some(next_event) = upstream_stream.next().await {
+                    match next_event {
+                        Ok(OpenAiStreamEvent::TextDelta(delta)) => {
+                            // Surface provider text incrementally as it arrives.
+                            turn_assistant_content.push_str(&delta);
+                            assistant_content.push_str(&delta);
+                            if sender
+                                .send(Ok(AgentEvent::MessageDelta { delta }))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Ok(OpenAiStreamEvent::ToolCall(tool_call)) => {
+                            // Surface tool request before execution so consumers can render it.
+                            let call_id = tool_call.call_id.clone();
+                            let tool_name = tool_call.tool_name.clone();
+                            let arguments = tool_call.arguments.clone();
+
+                            if sender
+                                .send(Ok(AgentEvent::ToolCallRequested {
+                                    call_id: call_id.clone(),
+                                    tool_name: tool_name.clone(),
+                                    arguments: arguments.clone(),
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+
+                            // Execute the local tool and persist both the assistant tool-call
+                            // metadata and tool output for the next provider request.
+                            let tool_output = tools.invoke(&tool_name, arguments).await;
+                            turn_tool_calls.push(tool_call);
+                            turn_tool_messages_for_history.push(OpenAiMessage::tool(
+                                call_id.clone(),
+                                tool_name.clone(),
+                                tool_output.to_string(),
+                            ));
+
+                            if sender
+                                .send(Ok(AgentEvent::ToolCallCompleted {
+                                    call_id,
+                                    tool_name,
+                                    output: tool_output,
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Ok(OpenAiStreamEvent::Done) => break,
+                        Err(error) => {
+                            let _ = sender
+                                .send(Err(AgentError::Provider(error.to_string())))
+                                .await;
+                            return;
+                        }
+                    }
+                }
+
+                {
+                    // Commit one complete assistant turn and any related tool outputs.
+                    let mut history_lock = history.lock().await;
+                    if turn_tool_calls.is_empty() {
+                        history_lock.push(OpenAiMessage::assistant(turn_assistant_content.clone()));
+                    } else {
+                        history_lock.push(OpenAiMessage::assistant_with_tool_calls(
+                            turn_assistant_content.clone(),
+                            turn_tool_calls
+                                .iter()
+                                .map(as_assistant_tool_call)
+                                .collect::<Vec<_>>(),
+                        ));
+                        history_lock.extend(turn_tool_messages_for_history);
+                    }
+                }
+
+                // Continue the loop until the model produces an assistant turn with no tools.
+                if turn_tool_calls.is_empty() {
+                    break;
                 }
             }
 
-            // Interface step 4:
-            // Commit this turn into conversation history exactly once:
-            // - assistant message (full assembled content)
-            // - tool outputs generated during this turn
-            {
-                let mut history_lock = history.lock().await;
-                history_lock.push(OpenAiMessage::assistant(assistant_content.clone()));
-                history_lock.extend(tool_messages_for_history);
-            }
-
-            // Interface step 5:
-            // Emit completion sentinel for UI consumers that need a deterministic
-            // "turn finished" signal with the final assembled content.
             let _ = sender
                 .send(Ok(AgentEvent::MessageComplete {
                     content: assistant_content,
@@ -344,6 +348,19 @@ where
         });
 
         Ok(Box::pin(ReceiverStream::new(receiver)))
+    }
+}
+
+/// Converts normalized tool call data into the OpenAI chat-completions assistant tool-call shape
+/// expected in follow-up request history.
+fn as_assistant_tool_call(tool_call: &OpenAiToolCall) -> OpenAiAssistantToolCall {
+    OpenAiAssistantToolCall {
+        id: tool_call.call_id.clone(),
+        kind: "function".to_owned(),
+        function: OpenAiAssistantFunctionCall {
+            name: tool_call.tool_name.clone(),
+            arguments: tool_call.arguments.to_string(),
+        },
     }
 }
 
@@ -384,18 +401,25 @@ mod tests {
         }
 
         async fn invoke(&self, arguments: Value) -> Result<Value, crate::tooling::ToolError> {
-            let a = arguments
-                .get("a")
-                .and_then(Value::as_i64)
-                .ok_or_else(|| crate::tooling::ToolError::Execution("missing a".to_owned()))?;
-            let b = arguments
-                .get("b")
-                .and_then(Value::as_i64)
-                .ok_or_else(|| crate::tooling::ToolError::Execution("missing b".to_owned()))?;
+            let a = arguments.get("a").and_then(Value::as_i64).ok_or_else(|| {
+                crate::tooling::ToolError::invalid_argument(
+                    "missing a",
+                    "Provide integer field `a`.",
+                    json!({}),
+                )
+            })?;
+            let b = arguments.get("b").and_then(Value::as_i64).ok_or_else(|| {
+                crate::tooling::ToolError::invalid_argument(
+                    "missing b",
+                    "Provide integer field `b`.",
+                    json!({}),
+                )
+            })?;
             Ok(json!({ "sum": a + b }))
         }
     }
 
+    #[derive(Clone)]
     struct MockOpenAiApi {
         scripted_streams: Arc<Mutex<VecDeque<Vec<Result<OpenAiStreamEvent, OpenAiApiError>>>>>,
         captured_requests: Arc<Mutex<Vec<OpenAiChatRequest>>>,
@@ -499,17 +523,25 @@ mod tests {
     #[tokio::test]
     async fn stream_response_executes_registered_tool_and_emits_events() {
         // Arrange:
-        // Script a single upstream tool call and then stream completion.
+        // Script two upstream turns:
+        // 1) model asks for a tool call
+        // 2) model receives tool result from history and emits final text
         let captured_requests = Arc::new(Mutex::new(Vec::new()));
         let mock_api = MockOpenAiApi::new(
-            vec![vec![
-                Ok(OpenAiStreamEvent::ToolCall(OpenAiToolCall {
-                    call_id: "call-1".to_owned(),
-                    tool_name: "sum".to_owned(),
-                    arguments: json!({ "a": 2, "b": 3 }),
-                })),
-                Ok(OpenAiStreamEvent::Done),
-            ]],
+            vec![
+                vec![
+                    Ok(OpenAiStreamEvent::ToolCall(OpenAiToolCall {
+                        call_id: "call-1".to_owned(),
+                        tool_name: "sum".to_owned(),
+                        arguments: json!({ "a": 2, "b": 3 }),
+                    })),
+                    Ok(OpenAiStreamEvent::Done),
+                ],
+                vec![
+                    Ok(OpenAiStreamEvent::TextDelta("The sum is 5.".to_owned())),
+                    Ok(OpenAiStreamEvent::Done),
+                ],
+            ],
             Arc::clone(&captured_requests),
         );
 
@@ -542,9 +574,15 @@ mod tests {
             .lock()
             .expect("request capture mutex should not be poisoned")
             .clone();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].tools.len(), 1);
         assert_eq!(requests[0].tools[0].name, "sum");
+        // The second request must include a tool role message carrying the first tool result.
+        assert!(requests[1].messages.iter().any(|message| {
+            message.role == crate::openai::OpenAiRole::Tool
+                && message.tool_call_id.as_deref() == Some("call-1")
+                && message.name.as_deref() == Some("sum")
+        }));
 
         // Assert:
         // First observable event should announce the model-requested tool call.
@@ -573,11 +611,74 @@ mod tests {
         ));
 
         // Assert:
-        // Completion event should still be emitted, even when no assistant text deltas occurred.
+        // Final delta should come from the second model turn after tool execution.
+        assert!(matches!(
+            &events[2],
+            AgentEvent::MessageDelta { delta } if delta == "The sum is 5."
+        ));
+
+        // Assert:
+        // Completion event should include the fully assembled assistant response.
         assert!(matches!(
             events.last(),
-            Some(AgentEvent::MessageComplete { content }) if content.is_empty()
+            Some(AgentEvent::MessageComplete { content }) if content == "The sum is 5."
         ));
+    }
+
+    /// Verifies that the plain `send_message` path performs iterative tool-call handling and
+    /// returns the final assistant text from the concluding non-tool turn.
+    #[tokio::test]
+    async fn send_message_loops_until_no_more_tool_calls() {
+        // Arrange:
+        // Simulate OpenAI asking for one tool and then responding with final text.
+        let captured_requests = Arc::new(Mutex::new(Vec::new()));
+        let mock_api = MockOpenAiApi::new(
+            vec![
+                vec![
+                    Ok(OpenAiStreamEvent::ToolCall(OpenAiToolCall {
+                        call_id: "call-7".to_owned(),
+                        tool_name: "sum".to_owned(),
+                        arguments: json!({ "a": 4, "b": 6 }),
+                    })),
+                    Ok(OpenAiStreamEvent::Done),
+                ],
+                vec![
+                    Ok(OpenAiStreamEvent::TextDelta("10".to_owned())),
+                    Ok(OpenAiStreamEvent::Done),
+                ],
+            ],
+            Arc::clone(&captured_requests),
+        );
+
+        let tool_registry = ToolRegistryBuilder::new()
+            .register_tool(SumTool)
+            .build()
+            .expect("tool registry should build");
+
+        let mut agent = OpenAiAgent::builder_with_api(mock_api)
+            .with_auth(OpenAiAuth::ApiKey("test-key".to_owned()))
+            .with_tool_registry(tool_registry)
+            .build()
+            .expect("builder should succeed with auth and tools");
+
+        // Act:
+        // The call should stay inside the implementation until a non-tool assistant turn arrives.
+        let reply = agent
+            .send_message("what is 4 + 6".to_owned())
+            .await
+            .expect("send_message should succeed");
+
+        // Assert:
+        // Final user-visible text should come from the second turn.
+        assert_eq!(reply.message, "10");
+
+        // Assert:
+        // Two provider requests are required: initial request and post-tool follow-up.
+        let requests = captured_requests
+            .lock()
+            .expect("request capture mutex should not be poisoned")
+            .clone();
+        assert_eq!(requests.len(), 2);
     }
 
     /// Verifies builder validation rejects agent construction when authentication is omitted.

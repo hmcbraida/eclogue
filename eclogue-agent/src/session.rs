@@ -55,15 +55,30 @@ pub type AgentEventStream =
     Pin<Box<dyn Stream<Item = Result<AgentEvent, AgentError>> + Send + 'static>>;
 
 /// Provider-independent session contract used by all agent implementations.
+///
+/// Contract for one user turn:
+/// 1. Persist the new user message and send a provider request.
+/// 2. If the provider emits tool calls, execute each requested tool.
+/// 3. Append tool outputs to the conversation history in provider-compatible form.
+/// 4. Immediately send a follow-up provider request with the updated history.
+/// 5. Repeat steps 2-4 until the provider emits no further tool calls.
+/// 6. Only then emit the final assistant completion for that user turn.
+///
+/// Implementations must not return control to the caller after the first tool execution cycle.
+/// A single `send_message` or `stream_response` invocation is responsible for completing the
+/// full tool-call loop for that turn.
 #[async_trait]
 pub trait AgentSession: Send {
     /// Sends a user message and waits for a complete assistant reply.
     ///
-    /// Implementations may internally consume a stream and aggregate deltas.
+    /// This method must execute the full per-turn tool-call loop described above and return
+    /// only once a final non-tool assistant message has been produced.
     async fn send_message(&mut self, message: String) -> Result<AgentReply, AgentError>;
 
     /// Sends a user message and returns a stream of response events.
     ///
     /// Streaming allows interactive UIs to render token deltas and tool call lifecycle events.
+    /// Implementations must continue streaming across iterative provider requests triggered by
+    /// tool calls until the turn fully completes, then emit exactly one `MessageComplete`.
     async fn stream_response(&mut self, message: String) -> Result<AgentEventStream, AgentError>;
 }

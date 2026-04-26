@@ -21,5 +21,6 @@ pub mod tooling;
 pub use error::AgentError;
 pub use session::{AgentEvent, AgentEventStream, AgentReply, AgentSession};
 pub use tooling::{
-    Tool, ToolDefinition, ToolError, ToolRegistry, ToolRegistryBuilder, ToolRegistryError,
+    Tool, ToolContext, ToolContextBuilder, ToolDefinition, ToolError, ToolErrorCode, ToolRegistry,
+    ToolRegistryBuilder, ToolRegistryError, next_request_id, register_default_tools,
 };

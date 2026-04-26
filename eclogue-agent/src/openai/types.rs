@@ -48,6 +48,12 @@ pub struct OpenAiMessage {
     /// Tool name for tool-related messages where available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Assistant tool calls associated with this message when role is `assistant`.
+    ///
+    /// OpenAI expects tool outputs to be preceded by the assistant message that requested
+    /// them, so we persist this metadata in history for follow-up requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<OpenAiAssistantToolCall>>,
 }
 
 impl OpenAiMessage {
@@ -58,6 +64,7 @@ impl OpenAiMessage {
             content,
             tool_call_id: None,
             name: None,
+            tool_calls: None,
         }
     }
 
@@ -68,6 +75,7 @@ impl OpenAiMessage {
             content,
             tool_call_id: None,
             name: None,
+            tool_calls: None,
         }
     }
 
@@ -78,6 +86,21 @@ impl OpenAiMessage {
             content,
             tool_call_id: None,
             name: None,
+            tool_calls: None,
+        }
+    }
+
+    /// Creates an assistant message that carries explicit tool call metadata.
+    pub(crate) fn assistant_with_tool_calls(
+        content: String,
+        tool_calls: Vec<OpenAiAssistantToolCall>,
+    ) -> Self {
+        Self {
+            role: OpenAiRole::Assistant,
+            content,
+            tool_call_id: None,
+            name: None,
+            tool_calls: Some(tool_calls),
         }
     }
 
@@ -88,8 +111,30 @@ impl OpenAiMessage {
             content,
             tool_call_id: Some(tool_call_id),
             name: Some(tool_name),
+            tool_calls: None,
         }
     }
+}
+
+/// Assistant-side tool call metadata stored in message history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAiAssistantToolCall {
+    /// Provider-generated tool call identifier.
+    pub id: String,
+    /// OpenAI chat-completions tool call type.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Function payload selected by the model.
+    pub function: OpenAiAssistantFunctionCall,
+}
+
+/// Function payload nested inside assistant-side tool call metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAiAssistantFunctionCall {
+    /// Registered tool name selected by the model.
+    pub name: String,
+    /// Tool arguments encoded as a JSON string for OpenAI chat completions requests.
+    pub arguments: String,
 }
 
 /// Provider-agnostic tool definition projected into OpenAI request shape.

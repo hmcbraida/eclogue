@@ -3,15 +3,16 @@
 //! This binary intentionally keeps behavior simple:
 //! - Build an OpenAI-backed session from environment-based auth.
 //! - Stream responses to stdout so runtime behavior is easy to inspect.
-//! - Skip tool registration for now (the library already supports it and tests cover it).
+//! - Register the full local tool suite so tool-calling behavior is observable end-to-end.
 
 use std::env;
 use std::error::Error;
 
 use eclogue_agent::openai::{OpenAiAgent, OpenAiAuth};
-use eclogue_agent::tooling::ToolRegistryBuilder;
+use eclogue_agent::tooling::{ToolContextBuilder, ToolRegistryBuilder, register_default_tools};
 use eclogue_agent::{AgentEvent, AgentSession};
 use futures_util::StreamExt;
+use serde_json::to_string_pretty;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// Chooses an auth mode from environment variables.
@@ -41,14 +42,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     };
 
-    // Build an empty tool registry for now. The binary intentionally avoids tool wiring yet.
-    let empty_tool_registry = ToolRegistryBuilder::new().build()?;
+    // Build a shared tool context rooted at the current working directory.
+    let workspace_root = env::current_dir()?;
+    let tool_context = ToolContextBuilder::new()
+        .with_workspace_root(workspace_root)
+        .build()?;
+
+    // Register all built-in tools (except `web_search`, intentionally not implemented).
+    let tool_registry_builder = register_default_tools(ToolRegistryBuilder::new(), tool_context);
+    let tool_registry = tool_registry_builder.build()?;
 
     // Construct the agent with explicit auth, model, and registry.
     let mut agent = OpenAiAgent::builder()
         .with_auth(auth)
         .with_model("gpt-4.1-mini")
-        .with_tool_registry(empty_tool_registry)
+        .with_tool_registry(tool_registry)
         .build()?;
 
     // Build async stdin/stdout interfaces for an interactive REPL loop.
@@ -97,10 +105,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     stdout.write_all(line.as_bytes()).await?;
                 }
                 AgentEvent::ToolCallCompleted {
-                    call_id, tool_name, ..
+                    call_id,
+                    tool_name,
+                    output,
                 } => {
                     let line = format!("[tool completed] id={call_id} name={tool_name}\n");
                     stdout.write_all(line.as_bytes()).await?;
+                    let output_line = format!(
+                        "{}\n",
+                        to_string_pretty(&output).unwrap_or_else(|_| output.to_string())
+                    );
+                    stdout.write_all(output_line.as_bytes()).await?;
                 }
             }
         }
