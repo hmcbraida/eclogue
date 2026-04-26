@@ -1,0 +1,3 @@
+[workspace]
+members = ["eclogue-agent", "eclogue-example"]
+resolver = "2"
