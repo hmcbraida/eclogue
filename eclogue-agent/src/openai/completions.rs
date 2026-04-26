@@ -288,15 +288,7 @@ where
                         // Invoke the registered local tool implementation synchronously
                         // within this response-processing task so event ordering remains:
                         // ToolCallRequested -> ToolCallCompleted.
-                        let tool_output = match tools.invoke(&tool_name, arguments).await {
-                            Ok(output) => output,
-                            Err(error) => {
-                                // Surface tool failures as stream errors so callers can
-                                // render a failed turn deterministically.
-                                let _ = sender.send(Err(AgentError::Tool(error))).await;
-                                return;
-                            }
-                        };
+                        let tool_output = tools.invoke(&tool_name, arguments).await;
 
                         // Store tool output in provider-message form for future turns.
                         tool_messages_for_history.push(OpenAiMessage::tool(

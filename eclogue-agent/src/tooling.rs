@@ -5,9 +5,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Value, json};
 use thiserror::Error;
 
 /// Static metadata for a tool that is exposed to the model provider.
@@ -50,34 +52,110 @@ pub trait Tool: Send + Sync {
     async fn invoke(&self, arguments: Value) -> Result<Value, ToolError>;
 }
 
-/// Immutable tool registry used by a running agent session.
+static TOOL_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn next_request_id() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let counter = TOOL_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("tool-{}-{}", millis, counter)
+}
+
+fn tool_error_payload(error: ToolError) -> Value {
+    let (code, retryable, suggested_action, details) = match &error {
+        ToolError::UnknownTool(tool_name) => (
+            "NOT_FOUND",
+            false,
+            "Call one of the registered tool names exposed in the tool list.",
+            json!({ "tool_name": tool_name }),
+        ),
+        ToolError::Execution(message) => (
+            "INTERNAL",
+            false,
+            "Inspect tool arguments and try again. If this persists, inspect tool implementation logs.",
+            json!({ "cause": message }),
+        ),
+    };
+
+    json!({
+        "ok": false,
+        "error": {
+            "code": code,
+            "message": error.to_string(),
+            "retryable": retryable,
+            "suggested_action": suggested_action,
+            "details": details
+        },
+        "request_id": next_request_id()
+    })
+}
+
+/// Immutable runtime registry of model-callable tools.
+///
+/// `ToolRegistry` is constructed once (typically during agent initialization) and then shared
+/// across turns. The type is intentionally immutable and cheap to clone:
+/// - The tool map and exported definitions are both internally `Arc`-backed.
+/// - Cloning a registry only bumps reference counts and does not copy tool instances.
+///
+/// Runtime contract:
+/// - Lookup is name-based and deterministic.
+/// - Invocations always return a JSON `Value`, even when lookup/execution fails.
+/// - Tool failures are normalized into a fixed in-band error payload, so downstream provider
+///   adapters can forward tool output to the model without provider-specific error branches.
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
-    /// Fast runtime lookup for tool invocation.
+    /// Fast runtime lookup table keyed by tool name.
+    ///
+    /// The map contents are fixed at build-time, which avoids synchronization primitives on
+    /// every invocation path.
     tools_by_name: Arc<HashMap<String, Arc<dyn Tool>>>,
-    /// Cached definitions so request builders can expose available tools to providers.
+    /// Cached definitions exposed to model providers during request construction.
+    ///
+    /// Keeping these precomputed avoids repeatedly asking each tool for metadata.
     definitions: Arc<Vec<ToolDefinition>>,
 }
 
 impl ToolRegistry {
-    /// Creates an empty registry.
+    /// Creates an empty registry with no tool definitions.
+    ///
+    /// This is mainly useful for tests or sessions that intentionally disable tool use.
     pub fn empty() -> Self {
         Self::default()
     }
 
-    /// Returns cloned tool definitions for request construction.
+    /// Returns tool definitions in registration order.
+    ///
+    /// Providers use this list to advertise available tools to the model. The returned vector is
+    /// a clone of cached metadata, not a live mutable view.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.definitions.as_ref().clone()
     }
 
-    /// Invokes a tool by name using JSON arguments from the model.
-    pub async fn invoke(&self, tool_name: &str, arguments: Value) -> Result<Value, ToolError> {
+    /// Invokes a tool by name using model-provided JSON arguments.
+    ///
+    /// Important behavior:
+    /// - Success paths forward the tool's JSON output unchanged.
+    /// - Unknown tool names are converted to the standardized in-band error schema.
+    /// - `Tool::invoke` execution errors are also converted to that same schema.
+    ///
+    /// This design ensures all tool outcomes are represented as ordinary JSON payloads for
+    /// downstream session/provider layers.
+    pub async fn invoke(&self, tool_name: &str, arguments: Value) -> Value {
         // The registry is immutable, so lookup is lock-free.
-        let tool = self
+        let tool_result = self
             .tools_by_name
             .get(tool_name)
-            .ok_or_else(|| ToolError::UnknownTool(tool_name.to_owned()))?;
-        tool.invoke(arguments).await
+            .ok_or_else(|| ToolError::UnknownTool(tool_name.to_owned()));
+
+        match tool_result {
+            Ok(tool) => match tool.invoke(arguments).await {
+                Ok(value) => value,
+                Err(error) => tool_error_payload(error),
+            },
+            Err(error) => tool_error_payload(error),
+        }
     }
 }
 
@@ -191,8 +269,7 @@ mod tests {
         // Act: invoke the tool with a JSON argument payload.
         let output = registry
             .invoke("echo", json!({ "message": "hello" }))
-            .await
-            .expect("tool invocation should succeed");
+            .await;
 
         // Assert: output includes the input payload under an "echoed" key.
         assert_eq!(
@@ -203,6 +280,53 @@ mod tests {
                 }
             })
         );
+    }
+
+    /// Tool that always fails with `ToolError::Execution` for registry normalization tests.
+    struct AlwaysFailTool;
+
+    #[async_trait]
+    impl Tool for AlwaysFailTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "always_fail".to_owned(),
+                description: "Always fails".to_owned(),
+                input_schema: json!({ "type": "object" }),
+            }
+        }
+
+        async fn invoke(&self, _arguments: Value) -> Result<Value, ToolError> {
+            Err(ToolError::Execution("forced failure".to_owned()))
+        }
+    }
+
+    /// This test verifies unknown tool requests are surfaced as in-band JSON error payloads.
+    #[tokio::test]
+    async fn registry_maps_unknown_tool_to_error_payload() {
+        let registry = ToolRegistryBuilder::new()
+            .register_tool(EchoTool)
+            .build()
+            .expect("tool registry should build without duplicates");
+
+        let output = registry.invoke("missing_tool", json!({})).await;
+        assert_eq!(output["ok"], json!(false));
+        assert_eq!(output["error"]["code"], json!("NOT_FOUND"));
+        assert!(output["request_id"].is_string());
+    }
+
+    /// This test verifies tool execution errors are surfaced as in-band JSON error payloads.
+    #[tokio::test]
+    async fn registry_maps_execution_error_to_error_payload() {
+        let registry = ToolRegistryBuilder::new()
+            .register_tool(AlwaysFailTool)
+            .build()
+            .expect("tool registry should build without duplicates");
+
+        let output = registry.invoke("always_fail", json!({})).await;
+        assert_eq!(output["ok"], json!(false));
+        assert_eq!(output["error"]["code"], json!("INTERNAL"));
+        assert_eq!(output["error"]["details"]["cause"], json!("forced failure"));
+        assert!(output["request_id"].is_string());
     }
 
     /// This test verifies that the builder rejects duplicate tool names.
