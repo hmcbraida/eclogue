@@ -12,8 +12,8 @@ use crate::tooling::{ToolRegistry, ToolRegistryBuilder, ToolRegistryError};
 
 use super::transport::ReqwestOpenAiApi;
 use super::types::{
-    OpenAiApi, OpenAiAssistantFunctionCall, OpenAiAssistantToolCall, OpenAiAuth,
-    OpenAiChatRequest, OpenAiMessage, OpenAiStreamEvent, OpenAiToolCall, OpenAiToolDefinition,
+    OpenAiApi, OpenAiAssistantFunctionCall, OpenAiAssistantToolCall, OpenAiAuth, OpenAiChatRequest,
+    OpenAiMessage, OpenAiStreamEvent, OpenAiToolCall, OpenAiToolDefinition,
 };
 
 /// Model identifier used when callers do not explicitly choose one.
@@ -61,7 +61,6 @@ impl<A: OpenAiApi> OpenAiAgent<A> {
     pub fn builder_with_api(api: A) -> OpenAiAgentBuilder<A> {
         OpenAiAgentBuilder::new(api)
     }
-
 }
 
 /// Builder used to construct an OpenAI-backed agent ergonomically.
@@ -307,6 +306,10 @@ where
                                 return;
                             }
                         }
+                        Ok(OpenAiStreamEvent::ResponseId(_)) => {
+                            // Chat-completions transport does not emit response ids; ignore this
+                            // variant so the shared stream event enum remains forward-compatible.
+                        }
                         Ok(OpenAiStreamEvent::Done) => break,
                         Err(error) => {
                             let _ = sender
@@ -353,7 +356,7 @@ where
 
 /// Converts normalized tool call data into the OpenAI chat-completions assistant tool-call shape
 /// expected in follow-up request history.
-fn as_assistant_tool_call(tool_call: &OpenAiToolCall) -> OpenAiAssistantToolCall {
+pub(crate) fn as_assistant_tool_call(tool_call: &OpenAiToolCall) -> OpenAiAssistantToolCall {
     OpenAiAssistantToolCall {
         id: tool_call.call_id.clone(),
         kind: "function".to_owned(),

@@ -8,12 +8,29 @@
 use std::env;
 use std::error::Error;
 
-use eclogue_agent::openai::{OpenAiAgent, OpenAiAuth};
+use eclogue_agent::openai::{OpenAiAuth, OpenAiResponsesAgent};
 use eclogue_agent::tooling::{ToolContextBuilder, ToolRegistryBuilder, register_default_tools};
 use eclogue_agent::{AgentEvent, AgentSession};
 use futures_util::StreamExt;
 use serde_json::to_string_pretty;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+/// Default behavioral contract for the interactive example agent.
+///
+/// This prompt is intentionally strict about tool-driven execution so implementation requests
+/// produce concrete workspace changes instead of prose-only examples.
+const DEFAULT_SYSTEM_PROMPT: &str = r#"You are an autonomous coding agent operating in a local workspace with callable tools.
+
+Execution policy:
+1. If the user asks to create, modify, or run a project, perform the work using tools.
+2. Do not return example-only code when tool execution is possible.
+3. Continue the tool loop until the task is fully completed (files created/edited, commands run, and results verified).
+4. Prefer inspecting current repo state first, then make minimal focused changes.
+5. If blocked (missing permissions, missing inputs, or failing commands), report the blocker and the exact next tool action needed.
+
+Output policy:
+- Summarize concrete actions taken and outcomes.
+- Include what files/commands were changed or run."#;
 
 /// Chooses an auth mode from environment variables.
 ///
@@ -53,9 +70,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let tool_registry = tool_registry_builder.build()?;
 
     // Construct the agent with explicit auth, model, and registry.
-    let mut agent = OpenAiAgent::builder()
+    let mut agent = OpenAiResponsesAgent::builder()
         .with_auth(auth)
         .with_model("gpt-5.3-codex")
+        .with_system_prompt(DEFAULT_SYSTEM_PROMPT)
         .with_tool_registry(tool_registry)
         .build()?;
 

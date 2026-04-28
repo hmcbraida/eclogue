@@ -192,6 +192,12 @@ pub enum OpenAiStreamEvent {
     /// This event should only be emitted once tool-call fragments have been fully assembled by
     /// the transport layer.
     ToolCall(OpenAiToolCall),
+    /// Responses API response identifier for the completed turn.
+    ///
+    /// This is emitted by the Responses transport when it receives a completion event that
+    /// includes the provider response id. Session implementations can use this to chain turns via
+    /// `previous_response_id` without exposing provider-specific details to callers.
+    ResponseId(String),
     /// End-of-response marker.
     ///
     /// Signals no more events will be emitted for the current provider stream.
