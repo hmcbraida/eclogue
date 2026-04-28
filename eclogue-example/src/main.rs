@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Construct the agent with explicit auth, model, and registry.
     let mut agent = OpenAiAgent::builder()
         .with_auth(auth)
-        .with_model("gpt-4.1-mini")
+        .with_model("gpt-5.3-codex")
         .with_tool_registry(tool_registry)
         .build()?;
 
